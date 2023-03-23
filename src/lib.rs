@@ -71,6 +71,8 @@ impl EvmRuntime {
                 None,
                 Arc::clone(&trie),
                 Arc::clone(&storage),
+                None,
+                None,
             ),
             trie,
             storage,
@@ -220,12 +222,12 @@ impl EvmRuntime {
 
     // Check transactions received from other nodes?
     pub fn check_signed_tx(&self, tx: &SignedTx) -> Result<()> {
-        self.mempool.tx_pre_check(tx, false)
+        self.mempool.tx_check_evm(tx, false)
     }
 
     // Cache transactions received from other nodes?
     pub fn cache_signed_tx(&self, tx: SignedTx) -> Result<()> {
-        self.mempool.tx_insert(tx, false)
+        self.mempool.tx_insert_evm(tx, false)
     }
 
     pub async fn spawn_jsonrpc_server(

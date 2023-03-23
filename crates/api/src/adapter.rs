@@ -56,7 +56,7 @@ impl DefaultAPIAdapter {
 #[async_trait]
 impl APIAdapter for DefaultAPIAdapter {
     async fn insert_signed_tx(&self, signed_tx: SignedTransaction) -> Result<()> {
-        self.mempool.tx_insert(signed_tx, true).c(d!())
+        self.mempool.tx_insert_evm(signed_tx, true).c(d!())
     }
 
     async fn get_block_by_number(&self, height: Option<u64>) -> Result<Option<Block>> {

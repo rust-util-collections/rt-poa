@@ -93,7 +93,11 @@ impl BlockMgmt {
         .c(d!())?;
         let exec_resp = Executor.exec(&mut evm_exec_backend, txs);
 
-        self.mempool.tx_cleanup(txs);
+        self.mempool.tx_cleanup(
+            &txs.iter()
+                .map(|tx| (tx.sender, tx.transaction.hash))
+                .collect::<Vec<_>>(),
+        );
 
         let block = Block::new(proposal, &exec_resp);
         let receipts = generate_receipts(
@@ -176,7 +180,7 @@ impl BlockMgmt {
                 if &tx.transaction.hash != hash_in_block {
                     return Err(eg!("Hash mismatch"));
                 }
-                self.mempool.tx_pre_check(tx, false).c(d!())
+                self.mempool.tx_check_evm(tx, false).c(d!())
             })
     }
 }

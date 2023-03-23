@@ -77,7 +77,7 @@ impl Config {
                 .c(d!())?;
 
             // take at most 1000 transactions to propose a new block
-            let txs = evm_rt.mempool_handler().tx_take_propose(1000);
+            let txs = evm_rt.mempool_handler().tx_take_propose_evm(1000);
 
             let header = producer.produce_block(txs.clone()).c(d!())?;
             dbg!(&header);

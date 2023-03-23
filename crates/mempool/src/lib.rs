@@ -13,6 +13,7 @@ use rt_evm_model::{
 };
 use rt_evm_storage::{MptStore, Storage};
 use ruc::*;
+use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
@@ -24,17 +25,28 @@ use std::{
     thread,
 };
 
-// decrease from u64::MAX
+// Decrease from u64::MAX
 static TX_INDEXER: AtomicU64 = AtomicU64::new(u64::MAX);
 
-pub use TinyMempool as Mempool;
+pub type EvmTxChecker = fn(&SignedTx, bool) -> Result<()>;
+pub type SysTxChecker = fn(&SysTx) -> Result<()>;
 
 #[derive(Clone)]
-pub struct TinyMempool {
-    // if number of tx exceed the capacity, deny new txs
+pub struct Mempool {
+    // If number of tx exceed the capacity, deny new transactions
     //
     // NOTE: lock order number is 1
-    txs: Arc<Mutex<BTreeMap<u64, SignedTx>>>,
+    txs_evm: Arc<Mutex<BTreeMap<u64, SignedTx>>>,
+    txs_sys: Arc<Mutex<BTreeMap<u64, SysTx>>>,
+
+    // Record transactions that need to be broadcasted
+    broadcast_queue_evm: Arc<Mutex<Vec<SignedTx>>>,
+    broadcast_queue_sys: Arc<Mutex<Vec<SysTx>>>,
+
+    // Pending transactions of each account
+    //
+    // NOTE: lock order number is 0
+    address_pending_cnter: Arc<RwLock<HashMap<H160, HashMap<Hash, u64>>>>,
 
     // key: <timestamp of tx> % <lifetime limitation>
     // value: the index of tx in `txs`
@@ -48,48 +60,41 @@ pub struct TinyMempool {
     //
     tx_lifetime_fields: Arc<Mutex<BTreeMap<u64, u64>>>,
 
-    // record transactions that need to be broadcasted
-    broadcast_queue: Arc<Mutex<Vec<SignedTx>>>,
-
-    // pending transactions of each account
-    //
-    // NOTE: lock order number is 0
-    address_pending_cnter: Arc<RwLock<HashMap<H160, HashMap<Hash, u64>>>>,
-
-    // if `true`, the background thread will exit itself.
+    // If `true`, the background thread will exit itself.
     stop_cleaner: Arc<AtomicBool>,
 
-    // for tx pre-check
-    trie_db: Arc<MptStore>,
-
-    // for tx pre-check
-    storage: Arc<Storage>,
-
-    cfg: TinyMempoolCfg,
+    cfg: MempoolCfg,
 }
 
-impl TinyMempool {
+impl Mempool {
     pub fn new(
         capacity: u64,
         tx_lifetime_in_secs: u64,
+
         tx_gas_cap: Option<u64>,
         trie_db: Arc<MptStore>,
         storage: Arc<Storage>,
+        tx_checker_evm: Option<EvmTxChecker>,
+        tx_checker_sys: Option<SysTxChecker>,
     ) -> Arc<Self> {
         let address_pending_cnter = Arc::new(RwLock::new(map! {}));
 
         let ret = Self {
-            txs: Arc::new(Mutex::new(BTreeMap::new())),
+            txs_evm: Arc::new(Mutex::new(BTreeMap::new())),
+            txs_sys: Arc::new(Mutex::new(BTreeMap::new())),
+            broadcast_queue_evm: Arc::new(Mutex::new(vec![])),
+            broadcast_queue_sys: Arc::new(Mutex::new(vec![])),
             tx_lifetime_fields: Arc::new(Mutex::new(BTreeMap::new())),
-            broadcast_queue: Arc::new(Mutex::new(vec![])),
             address_pending_cnter,
             stop_cleaner: Arc::new(AtomicBool::new(false)),
-            trie_db,
-            storage,
-            cfg: TinyMempoolCfg {
+            cfg: MempoolCfg {
                 capacity,
                 tx_lifetime_in_secs,
                 tx_gas_cap: tx_gas_cap.unwrap_or(MAX_BLOCK_GAS_LIMIT).into(),
+                trie_db,
+                storage,
+                tx_checker_evm,
+                tx_checker_sys,
             },
         };
         let ret = Arc::new(ret);
@@ -122,10 +127,10 @@ impl TinyMempool {
                     continue;
                 };
 
-                // For avoiding 'dead lock',
-                // we call `collect` and then `iter` again
+                // Deal with evm transactions,
+                // we call `collect` and then `iter` again to avoid `dead lock`
                 let to_del = hdr_ret
-                    .txs
+                    .txs_evm
                     .lock()
                     .split_off(&idx_gurad)
                     .into_values()
@@ -136,15 +141,29 @@ impl TinyMempool {
                         i.remove(&tx.transaction.hash);
                     }
                 });
+
+                // Deal with sys transactions,
+                let to_del = hdr_ret
+                    .txs_sys
+                    .lock()
+                    .split_off(&idx_gurad)
+                    .into_values()
+                    .collect::<Vec<_>>();
+                let mut pending_cnter = hdr_ret.address_pending_cnter.write();
+                to_del.iter().for_each(|tx| {
+                    if let Some(i) = pending_cnter.get_mut(&tx.sender) {
+                        i.remove(&tx.hash);
+                    }
+                });
             }
         });
 
         ret
     }
 
-    // Add a new transaction to mempool
+    // Add a new evm transaction to mempool
     #[cfg_attr(feature = "benchmark", allow(dead_code))]
-    pub fn tx_insert(&self, tx: SignedTx, signature_checked: bool) -> Result<()> {
+    pub fn tx_insert_evm(&self, tx: SignedTx, signature_checked: bool) -> Result<()> {
         if self.tx_pending_cnt(None) > self.cfg.capacity {
             return Err(eg!("Mempool is full"));
         }
@@ -160,9 +179,13 @@ impl TinyMempool {
         }
 
         #[cfg(not(feature = "benchmark"))]
-        self.tx_pre_check(&tx, signature_checked).c(d!())?;
+        if let Some(checker) = self.cfg.tx_checker_evm.as_ref() {
+            checker(&tx, signature_checked).c(d!())?;
+        } else {
+            self.tx_check_evm(&tx, signature_checked).c(d!())?;
+        }
 
-        self.broadcast_queue.lock().push(tx.clone());
+        self.broadcast_queue_evm.lock().push(tx.clone());
 
         let idx = TX_INDEXER.fetch_sub(1, AtoOrd::Relaxed);
 
@@ -176,12 +199,53 @@ impl TinyMempool {
             .lock()
             .insert(ts!() % self.cfg.tx_lifetime_in_secs, idx);
 
-        self.txs.lock().insert(idx, tx);
+        self.txs_evm.lock().insert(idx, tx);
 
         Ok(())
     }
 
-    // transactions that !maybe! have not been confirmed
+    // Add a new sys transaction to mempool
+    #[cfg_attr(feature = "benchmark", allow(dead_code))]
+    pub fn tx_insert_sys(&self, tx: SysTx) -> Result<()> {
+        if self.tx_pending_cnt(None) > self.cfg.capacity {
+            return Err(eg!("Mempool is full"));
+        }
+
+        if self
+            .address_pending_cnter
+            .read()
+            .get(&tx.sender)
+            .and_then(|m| m.get(&tx.hash))
+            .is_some()
+        {
+            return Err(eg!("Already cached in mempool"));
+        }
+
+        #[cfg(not(feature = "benchmark"))]
+        if let Some(checker) = self.cfg.tx_checker_sys.as_ref() {
+            checker(&tx).c(d!())?;
+        }
+
+        self.broadcast_queue_sys.lock().push(tx.clone());
+
+        let idx = TX_INDEXER.fetch_sub(1, AtoOrd::Relaxed);
+
+        self.address_pending_cnter
+            .write()
+            .entry(tx.sender)
+            .or_insert(map! {})
+            .insert(tx.hash, idx);
+
+        self.tx_lifetime_fields
+            .lock()
+            .insert(ts!() % self.cfg.tx_lifetime_in_secs, idx);
+
+        self.txs_sys.lock().insert(idx, tx);
+
+        Ok(())
+    }
+
+    // Transactions that **maybe** have not been confirmed
     pub fn tx_pending_cnt(&self, addr: Option<H160>) -> u64 {
         if let Some(addr) = addr {
             self.address_pending_cnter
@@ -190,23 +254,28 @@ impl TinyMempool {
                 .map(|i| i.len() as u64)
                 .unwrap_or_default()
         } else {
-            self.txs.lock().len() as u64
+            (self.txs_evm.lock().len() + self.txs_sys.lock().len()) as u64
         }
     }
 
-    // broadcast transactions to other nodes ?
-    pub fn tx_take_broadcast(&self) -> Vec<SignedTx> {
-        mem::take(&mut *self.broadcast_queue.lock())
+    // Broadcast evm transactions to other nodes ?
+    pub fn tx_take_broadcast_evm(&self) -> Vec<SignedTx> {
+        mem::take(&mut *self.broadcast_queue_evm.lock())
     }
 
-    // package some transactions for proposing a new block ?
-    pub fn tx_take_propose(&self, limit: usize) -> Vec<SignedTx> {
+    // Broadcast sys transactions to other nodes ?
+    pub fn tx_take_broadcast_sys(&self) -> Vec<SysTx> {
+        mem::take(&mut *self.broadcast_queue_sys.lock())
+    }
+
+    // Package transactions for proposing a new block ?
+    pub fn tx_take_propose_evm(&self, cnt: usize) -> Vec<SignedTx> {
         let mut ret = self
-            .txs
+            .txs_evm
             .lock()
             .iter()
             .rev()
-            .take(limit)
+            .take(cnt)
             .map(|(_, tx)| tx.clone())
             .collect::<Vec<_>>();
 
@@ -229,21 +298,34 @@ impl TinyMempool {
         ret
     }
 
+    // Package transactions for proposing a new block ?
+    pub fn tx_take_propose_sys(&self, cnt: usize) -> Vec<SysTx> {
+        self.txs_sys
+            .lock()
+            .iter()
+            .rev()
+            .take(cnt)
+            .map(|(_, tx)| tx.clone())
+            .collect()
+    }
+
     // Remove transactions after they have been confirmed ?
-    pub fn tx_cleanup(&self, to_del: &[SignedTx]) {
+    pub fn tx_cleanup(&self, to_del: &[(H160, Hash)]) {
         let mut pending_cnter = self.address_pending_cnter.write();
-        let mut txs = self.txs.lock();
-        to_del.iter().for_each(|tx| {
-            if let Some(i) = pending_cnter.get_mut(&tx.sender) {
-                if let Some(idx) = i.remove(&tx.transaction.hash) {
-                    txs.remove(&idx);
+        let mut txs_evm = self.txs_evm.lock();
+        let mut txs_sys = self.txs_sys.lock();
+        to_del.iter().for_each(|(sender, txhash)| {
+            if let Some(i) = pending_cnter.get_mut(sender) {
+                if let Some(idx) = i.remove(txhash) {
+                    txs_evm.remove(&idx);
+                    txs_sys.remove(&idx);
                 }
             }
         });
     }
 
     // Pre-check the tx before execute it.
-    pub fn tx_pre_check(&self, tx: &SignedTx, signature_checked: bool) -> Result<()> {
+    pub fn tx_check_evm(&self, tx: &SignedTx, signature_checked: bool) -> Result<()> {
         let utx = &tx.transaction;
 
         let gas_price = utx.unsigned.gas_price();
@@ -288,7 +370,13 @@ impl TinyMempool {
             return Err(eg!("Insufficient balance to cover possible gas"));
         }
 
-        if self.storage.get_tx_by_hash(&utx.hash).c(d!())?.is_some() {
+        if self
+            .cfg
+            .storage
+            .get_tx_by_hash(&utx.hash)
+            .c(d!())?
+            .is_some()
+        {
             return Err(eg!("Historical transaction detected"));
         }
 
@@ -301,12 +389,13 @@ impl TinyMempool {
         number: Option<BlockNumber>,
     ) -> Result<Account> {
         let header = if let Some(n) = number {
-            self.storage.get_block_header(n).c(d!())?.c(d!())?
+            self.cfg.storage.get_block_header(n).c(d!())?.c(d!())?
         } else {
-            self.storage.get_latest_block_header().c(d!())?
+            self.cfg.storage.get_latest_block_header().c(d!())?
         };
 
         let state = self
+            .cfg
             .trie_db
             .trie_restore(&WORLD_STATE_META_KEY, header.state_root)
             .c(d!())?;
@@ -323,10 +412,29 @@ impl TinyMempool {
     }
 }
 
-// Set once, and then immutable forever ?
 #[derive(Clone)]
-struct TinyMempoolCfg {
+struct MempoolCfg {
+    // Static fields,
+    // set once, and then immutable forever ?
     capacity: u64,
     tx_lifetime_in_secs: u64,
-    tx_gas_cap: U256, // for tx pre-check
+
+    // fields for tx pre-check
+    tx_gas_cap: U256,
+    trie_db: Arc<MptStore>,
+    storage: Arc<Storage>,
+
+    tx_checker_evm: Option<EvmTxChecker>,
+    tx_checker_sys: Option<SysTxChecker>,
+}
+
+// TODO
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SysTx {
+    sender: H160,
+
+    // hash of `raw_tx`
+    hash: Hash,
+
+    raw_tx: Vec<u8>,
 }
